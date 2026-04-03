@@ -7,8 +7,13 @@ from typing import Any
 import ROOT
 
 from analysis.common import write_json
-from analysis.stats.fit import FIT_ID
-from analysis.stats.models import make_weighted_bin_center_dataset, pdf_to_counts
+from analysis.stats.fit import (
+    FIT_ID,
+    build_exact_asimov_dataset,
+    exact_binned_counts,
+    fit_exact_binned_category_nll_sum,
+    fit_unbinned_category_nll_sum,
+)
 
 ROOT.gROOT.SetBatch(True)
 
@@ -32,6 +37,8 @@ def _snapshot_fit_state(fit_context: dict) -> dict[str, Any]:
             "value": float(shared_mu.getVal()),
             "error": float(shared_mu.getError()),
             "constant": bool(shared_mu.isConstant()),
+            "min": float(shared_mu.getMin()),
+            "max": float(shared_mu.getMax()),
         },
         "categories": {},
     }
@@ -57,6 +64,7 @@ def _snapshot_fit_state(fit_context: dict) -> dict[str, Any]:
 def _restore_fit_state(fit_context: dict, snapshot: dict[str, Any]) -> None:
     shared_mu = fit_context["shared_mu"]
     shared_mu.setVal(snapshot["shared_mu"]["value"])
+    shared_mu.setRange(snapshot["shared_mu"]["min"], snapshot["shared_mu"]["max"])
     shared_mu.setConstant(snapshot["shared_mu"]["constant"])
     shared_mu.setError(snapshot["shared_mu"]["error"])
 
@@ -79,12 +87,12 @@ def _restore_fit_state(fit_context: dict, snapshot: dict[str, Any]) -> None:
 def _capture_model_counts(fit_context: dict) -> dict[str, dict[str, list[float]]]:
     category_payload: dict[str, dict[str, list[float]]] = {}
     for category, model_ctx in fit_context["final_models"].items():
-        signal_counts = pdf_to_counts(
+        signal_counts = exact_binned_counts(
             model_ctx["signal_pdf"],
             fit_context["common_mass"],
             float(model_ctx["nsig"].getVal()),
         )
-        background_counts = pdf_to_counts(
+        background_counts = exact_binned_counts(
             model_ctx["background_pdf"],
             fit_context["common_mass"],
             float(model_ctx["nbkg"].getVal()),
@@ -190,35 +198,17 @@ def _asimov_plot_payload(
 
 def _asimov_dataset(fit_context: dict):
     _set_generation_snapshot(fit_context)
-    common_mass = fit_context["common_mass"]
-    channel = fit_context["channel"]
     shared_mu = fit_context["shared_mu"]
     shared_mu.setVal(1.0)
     shared_mu.setConstant(False)
-
-    import_map = {}
-    category_payload = {}
-    for category, model_ctx in fit_context["final_models"].items():
-        signal_yield = float(model_ctx["s_const"].getVal())
-        background_yield = float(fit_context["category_context"][category]["template_total_yield"])
-        signal_counts = pdf_to_counts(model_ctx["signal_pdf"], common_mass, signal_yield)
-        background_counts = pdf_to_counts(model_ctx["background_pdf"], common_mass, background_yield)
-        total_counts = signal_counts + background_counts
-        dataset = make_weighted_bin_center_dataset(f"asimov_{category}", common_mass, total_counts)
-        import_map[category] = dataset
-        category_payload[category] = {
-            "signal_counts": signal_counts.tolist(),
-            "background_counts": background_counts.tolist(),
-            "total_counts": total_counts.tolist(),
-        }
-    combined = ROOT.RooDataSet(
-        "asimovData",
-        "asimovData",
-        ROOT.RooArgSet(common_mass, channel),
-        Index=channel,
-        Import=import_map,
+    combined, category_datahists, category_payload = build_exact_asimov_dataset(
+        category_context=fit_context["category_context"],
+        final_models=fit_context["final_models"],
+        common_mass=fit_context["common_mass"],
+        channel=fit_context["channel"],
+        dataset_name="asimovData",
     )
-    return combined, category_payload
+    return combined, category_datahists, category_payload
 
 
 def _free_parameter_policy(observed_significance_allowed: bool) -> dict[str, Any]:
@@ -293,15 +283,28 @@ def _observed_significance(
 ) -> dict[str, Any]:
     measurement_snapshot = _snapshot_fit_state(fit_context)
     shared_mu = fit_context["shared_mu"]
+    shared_mu.setRange(0.0, shared_mu.getMax())
     shared_mu.setVal(1.0)
 
-    free_result = _fit_with_mu(fit_context, fit_context["combined_data"], mu_value=None)
-    twice_nll_free = 2.0 * float(free_result.minNll())
+    free_fit = fit_unbinned_category_nll_sum(
+        final_models=fit_context["final_models"],
+        category_datasets=fit_context["measurement_category_data"] or {},
+        shared_mu=shared_mu,
+        mu_value=None,
+    )
+    free_result = free_fit["result"]
+    twice_nll_free = 2.0 * float(free_fit["nll_value"])
     mu_hat = float(shared_mu.getVal())
     mu_uncertainty = float(shared_mu.getError())
 
-    mu0_result = _fit_with_mu(fit_context, fit_context["combined_data"], mu_value=0.0)
-    twice_nll_mu0 = 2.0 * float(mu0_result.minNll())
+    mu0_fit = fit_unbinned_category_nll_sum(
+        final_models=fit_context["final_models"],
+        category_datasets=fit_context["measurement_category_data"] or {},
+        shared_mu=shared_mu,
+        mu_value=0.0,
+    )
+    mu0_result = mu0_fit["result"]
+    twice_nll_mu0 = 2.0 * float(mu0_fit["nll_value"])
     q0_raw = max(twice_nll_mu0 - twice_nll_free, 0.0)
     q0 = q0_raw if mu_hat > 0.0 else 0.0
     z_discovery = math.sqrt(q0)
@@ -312,6 +315,14 @@ def _observed_significance(
         diagnostics.append("Free-mu observed significance fit returned a non-zero RooFit status.")
     if mu0_result.status() != 0:
         diagnostics.append("Mu=0 observed significance fit returned a non-zero RooFit status.")
+    if free_fit["minimize_status"] != 0:
+        diagnostics.append("Free-mu observed significance migrad returned a non-zero Minuit2 status.")
+    if mu0_fit["minimize_status"] != 0:
+        diagnostics.append("Mu=0 observed significance migrad returned a non-zero Minuit2 status.")
+    if free_fit["hesse_status"] != 0:
+        diagnostics.append("Free-mu observed significance hesse returned a non-zero Minuit2 status.")
+    if mu0_fit["hesse_status"] != 0:
+        diagnostics.append("Mu=0 observed significance hesse returned a non-zero Minuit2 status.")
     if free_result.covQual() < 2:
         diagnostics.append("Free-mu observed significance fit covariance quality is below the acceptable threshold of 2.")
     if mu0_result.covQual() < 2:
@@ -335,6 +346,7 @@ def _observed_significance(
         "fit_range": fit_range,
         "blind_window_in_observed_data": signal_window if blinding["plot_signal_window"] else None,
         "observed_significance_allowed": bool(blinding["observed_significance_allowed"]),
+        "nll_construction": "summed_per_category_unbinned_nll",
         "signal_shape_parameter_policy": "fixed_from_signal_mc_fit",
         "background_parameter_policy": "floating_shape_and_normalization",
         "background_parameter_source": background_parameter_source,
@@ -344,6 +356,10 @@ def _observed_significance(
         "fit_status_mu0": int(mu0_result.status()),
         "cov_qual_free": int(free_result.covQual()),
         "cov_qual_mu0": int(mu0_result.covQual()),
+        "minimize_status_free": free_fit["minimize_status"],
+        "minimize_status_mu0": mu0_fit["minimize_status"],
+        "hesse_status_free": free_fit["hesse_status"],
+        "hesse_status_mu0": mu0_fit["hesse_status"],
         "diagnostics": diagnostics,
     }
     _restore_fit_state(fit_context, measurement_snapshot)
@@ -377,19 +393,31 @@ def run_significance(fit_context: dict, summary: dict, outputs: Path) -> dict[st
     write_json(observed_artifact, fit_dir / "significance.json")
 
     measurement_snapshot = _snapshot_fit_state(fit_context)
-    asimov_data, asimov_payload = _asimov_dataset(fit_context)
+    asimov_data, asimov_category_data, asimov_payload = _asimov_dataset(fit_context)
     shared_mu = fit_context["shared_mu"]
-    simultaneous = fit_context["simultaneous"]
 
+    shared_mu.setRange(0.0, shared_mu.getMax())
     shared_mu.setVal(1.0)
-    free_result = _fit_with_mu(fit_context, asimov_data, mu_value=None)
-    twice_nll_free = 2.0 * float(free_result.minNll())
+    free_fit = fit_exact_binned_category_nll_sum(
+        final_models=fit_context["final_models"],
+        category_datahists=asimov_category_data,
+        shared_mu=shared_mu,
+        mu_value=None,
+    )
+    free_result = free_fit["result"]
+    twice_nll_free = 2.0 * float(free_fit["nll_value"])
     mu_hat = float(shared_mu.getVal())
     mu_uncertainty = float(shared_mu.getError())
     free_fit_counts = _capture_model_counts(fit_context)
 
-    mu0_result = _fit_with_mu(fit_context, asimov_data, mu_value=0.0)
-    twice_nll_mu0 = 2.0 * float(mu0_result.minNll())
+    mu0_fit = fit_exact_binned_category_nll_sum(
+        final_models=fit_context["final_models"],
+        category_datahists=asimov_category_data,
+        shared_mu=shared_mu,
+        mu_value=0.0,
+    )
+    mu0_result = mu0_fit["result"]
+    twice_nll_mu0 = 2.0 * float(mu0_fit["nll_value"])
     q0 = max(twice_nll_mu0 - twice_nll_free, 0.0)
     z_discovery = math.sqrt(q0)
     mu0_fit_counts = _capture_model_counts(fit_context)
@@ -400,6 +428,14 @@ def run_significance(fit_context: dict, summary: dict, outputs: Path) -> dict[st
         diagnostics.append("Free-mu Asimov significance fit returned a non-zero RooFit status.")
     if mu0_result.status() != 0:
         diagnostics.append("Mu=0 Asimov significance fit returned a non-zero RooFit status.")
+    if free_fit["minimize_status"] != 0:
+        diagnostics.append("Free-mu Asimov significance migrad returned a non-zero Minuit2 status.")
+    if mu0_fit["minimize_status"] != 0:
+        diagnostics.append("Mu=0 Asimov significance migrad returned a non-zero Minuit2 status.")
+    if free_fit["hesse_status"] != 0:
+        diagnostics.append("Free-mu Asimov significance hesse returned a non-zero Minuit2 status.")
+    if mu0_fit["hesse_status"] != 0:
+        diagnostics.append("Mu=0 Asimov significance hesse returned a non-zero Minuit2 status.")
     if free_result.covQual() < 2:
         diagnostics.append("Free-mu Asimov significance fit covariance quality is below the acceptable threshold of 2.")
     if mu0_result.covQual() < 2:
@@ -421,7 +457,8 @@ def run_significance(fit_context: dict, summary: dict, outputs: Path) -> dict[st
         "z_discovery": z_discovery,
         "fit_range": fit_range,
         "background_parameter_source": background_parameter_source,
-        "asimov_source": "weighted_bin_center_dataset",
+        "asimov_source": "exact_binned_asimov_histogram",
+        "nll_construction": "summed_per_category_binned_nll_with_bin_integrals",
         "observed_significance_allowed": bool(blinding["observed_significance_allowed"]),
         "signal_shape_parameter_policy": "fixed_from_signal_mc_fit",
         "background_parameter_policy": "floating_shape_and_normalization",
@@ -431,6 +468,10 @@ def run_significance(fit_context: dict, summary: dict, outputs: Path) -> dict[st
         "fit_status_mu0": int(mu0_result.status()),
         "cov_qual_free": int(free_result.covQual()),
         "cov_qual_mu0": int(mu0_result.covQual()),
+        "minimize_status_free": free_fit["minimize_status"],
+        "minimize_status_mu0": mu0_fit["minimize_status"],
+        "hesse_status_free": free_fit["hesse_status"],
+        "hesse_status_mu0": mu0_fit["hesse_status"],
         "diagnostics": diagnostics,
     }
     construction_artifact = {
@@ -439,9 +480,10 @@ def run_significance(fit_context: dict, summary: dict, outputs: Path) -> dict[st
         "dataset_type": "asimov",
         "generation_range": fit_range,
         "blind_window_in_observed_data": summary["runtime_defaults"]["signal_window_gev"],
-        "construction_mode": "weighted_bin_center_dataset",
+        "construction_mode": "exact_binned_asimov_histogram",
         "binning": {"observable": "m_gg", "n_bins": 55, "range": fit_range},
-        "weighted_dataset_object_type": "RooDataSet",
+        "weighted_dataset_object_type": "RooDataHist",
+        "nll_construction": "summed_per_category_binned_nll_with_bin_integrals",
         "fixed_generation_inputs": [
             "signal yield normalized to MC prediction",
             "signal DSCB shape parameters from the signal-MC fit",

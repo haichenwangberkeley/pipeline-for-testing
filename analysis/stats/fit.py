@@ -25,10 +25,165 @@ from analysis.stats.models import (
 ROOT.gROOT.SetBatch(True)
 
 FIT_ID = "FIT1"
+ASIMOV_BIN_INTEGRAL_PRECISION = 1e-3
+
+
+def _unique_name(prefix: str) -> str:
+    return f"{prefix}_{ROOT.TUUID().AsString().replace('-', '_')}"
 
 
 def _concat(chunks: list[np.ndarray]) -> np.ndarray:
     return np.concatenate(chunks) if chunks else np.array([])
+
+
+def exact_binned_counts(pdf, mass_var, yield_value: float) -> np.ndarray:
+    counts = np.zeros(mass_var.numBins(), dtype=float)
+    observable = ROOT.RooArgSet(mass_var)
+    binning = mass_var.getBinning()
+    range_name = _unique_name(f"{pdf.GetName()}_bin")
+    for idx in range(mass_var.numBins()):
+        mass_var.setRange(range_name, binning.binLow(idx), binning.binHigh(idx))
+        integral = pdf.createIntegral(observable, NormSet=observable, Range=range_name)
+        ROOT.SetOwnership(integral, True)
+        counts[idx] = float(integral.getVal())
+    counts = np.clip(counts, 0.0, None)
+    if counts.sum() > 0.0:
+        counts *= float(yield_value) / counts.sum()
+    return counts
+
+
+def _make_exact_binned_hist(name: str, mass_var, counts: np.ndarray):
+    data_hist = ROOT.RooDataHist(name, name, ROOT.RooArgSet(mass_var))
+    for idx, value in enumerate(np.asarray(counts, dtype=float)):
+        data_hist.set(idx, float(value), -1.0)
+    return data_hist
+
+
+def build_exact_asimov_dataset(
+    *,
+    category_context: dict[str, Any],
+    final_models: dict[str, Any],
+    common_mass,
+    channel,
+    dataset_name: str,
+) -> tuple[Any, dict[str, Any], dict[str, Any]]:
+    import_map = {}
+    category_hists: dict[str, Any] = {}
+    category_payload: dict[str, Any] = {}
+    for category, ctx in category_context.items():
+        signal_counts = exact_binned_counts(
+            final_models[category]["signal_pdf"],
+            common_mass,
+            float(final_models[category]["s_const"].getVal()),
+        )
+        background_counts = exact_binned_counts(
+            final_models[category]["background_pdf"],
+            common_mass,
+            float(ctx["template_total_yield"]),
+        )
+        total_counts = signal_counts + background_counts
+        data_hist = _make_exact_binned_hist(f"{dataset_name}_{category}", common_mass, total_counts)
+        import_map[category] = data_hist
+        category_hists[category] = data_hist
+        category_payload[category] = {
+            "signal_counts": signal_counts.tolist(),
+            "background_counts": background_counts.tolist(),
+            "total_counts": total_counts.tolist(),
+        }
+    combined = ROOT.RooDataHist(
+        dataset_name,
+        dataset_name,
+        ROOT.RooArgList(common_mass),
+        Index=channel,
+        Import=import_map,
+    )
+    return combined, category_hists, category_payload
+
+
+def _fit_category_nll_sum(
+    *,
+    final_models: dict[str, Any],
+    category_data: dict[str, Any],
+    shared_mu,
+    mu_value: float | None,
+    binned: bool,
+) -> dict[str, Any]:
+    held_objects = list(category_data.values())
+    nll_terms = ROOT.RooArgList()
+    for category, dataset in category_data.items():
+        nll_args = [
+            ROOT.RooFit.Extended(True),
+            ROOT.RooFit.Range("full"),
+        ]
+        if binned:
+            nll_args.extend(
+                [
+                    ROOT.RooFit.Offset("bin"),
+                    ROOT.RooFit.IntegrateBins(ASIMOV_BIN_INTEGRAL_PRECISION),
+                ]
+            )
+        else:
+            nll_args.append(ROOT.RooFit.Offset(True))
+        nll = final_models[category]["model"].createNLL(dataset, *nll_args)
+        held_objects.append(nll)
+        nll_terms.add(nll)
+    total_nll = ROOT.RooAddition(_unique_name("totalNll"), _unique_name("totalNll"), nll_terms)
+    held_objects.append(total_nll)
+
+    if mu_value is None:
+        shared_mu.setConstant(False)
+    else:
+        shared_mu.setVal(float(mu_value))
+        shared_mu.setConstant(True)
+
+    minimizer = ROOT.RooMinimizer(total_nll)
+    minimizer.setPrintLevel(-1)
+    minimizer.setStrategy(2)
+    minimizer.optimizeConst(2)
+    minimize_status = int(minimizer.minimize("Minuit2", "Migrad"))
+    hesse_status = int(minimizer.hesse())
+    result = minimizer.save()
+    held_objects.extend([minimizer, result])
+    return {
+        "result": result,
+        "nll_value": float(total_nll.getVal()),
+        "minimize_status": minimize_status,
+        "hesse_status": hesse_status,
+        "held_objects": held_objects,
+        "fit_method": "summed_per_category_binned_nll" if binned else "summed_per_category_unbinned_nll",
+    }
+
+
+def fit_exact_binned_category_nll_sum(
+    *,
+    final_models: dict[str, Any],
+    category_datahists: dict[str, Any],
+    shared_mu,
+    mu_value: float | None,
+) -> dict[str, Any]:
+    return _fit_category_nll_sum(
+        final_models=final_models,
+        category_data=category_datahists,
+        shared_mu=shared_mu,
+        mu_value=mu_value,
+        binned=True,
+    )
+
+
+def fit_unbinned_category_nll_sum(
+    *,
+    final_models: dict[str, Any],
+    category_datasets: dict[str, Any],
+    shared_mu,
+    mu_value: float | None,
+) -> dict[str, Any]:
+    return _fit_category_nll_sum(
+        final_models=final_models,
+        category_data=category_datasets,
+        shared_mu=shared_mu,
+        mu_value=mu_value,
+        binned=False,
+    )
 
 
 def aggregate_processed_samples(processed_samples: list[dict]) -> dict[str, dict[str, dict[str, np.ndarray]]]:
@@ -314,12 +469,12 @@ def _build_final_model(category: str, mass_var, signal_artifact: dict, choice: d
 def _model_plot_payload(final_models: dict[str, Any], mass_var, fit_range: list[float]) -> dict[str, Any]:
     categories: dict[str, Any] = {}
     for category, model_ctx in final_models.items():
-        signal_counts = pdf_to_counts(
+        signal_counts = exact_binned_counts(
             model_ctx["signal_pdf"],
             mass_var,
             float(model_ctx["nsig"].getVal()),
         )
-        background_counts = pdf_to_counts(
+        background_counts = exact_binned_counts(
             model_ctx["background_pdf"],
             mass_var,
             float(model_ctx["nbkg"].getVal()),
@@ -362,9 +517,9 @@ def _measurement_dataset(
     common_mass,
     channel,
     use_observed_data: bool,
-) -> tuple[Any, str, dict[str, Any]]:
+) -> tuple[Any, str, dict[str, Any], dict[str, Any] | None]:
     if use_observed_data:
-        combined_import = {
+        category_datasets = {
             category: make_weighted_dataset(f"data_{category}", common_mass, ctx["data_masses"])
             for category, ctx in category_context.items()
         }
@@ -373,7 +528,7 @@ def _measurement_dataset(
             "combData",
             ROOT.RooArgSet(common_mass, channel),
             Index=channel,
-            Import=combined_import,
+            Import=category_datasets,
         )
         return combined_data, "observed", {
             "status": "ok",
@@ -381,39 +536,25 @@ def _measurement_dataset(
             "construction_mode": "selected_event_dataset",
             "blinding_policy_applied": False,
             "categories": sorted(category_context.keys()),
-        }
+        }, category_datasets
 
-    import_map = {}
-    category_payload: dict[str, Any] = {}
-    for category, ctx in category_context.items():
-        signal_yield = float(final_models[category]["s_const"].getVal())
-        background_yield = float(ctx["template_total_yield"])
-        signal_counts = pdf_to_counts(final_models[category]["signal_pdf"], common_mass, signal_yield)
-        background_counts = pdf_to_counts(final_models[category]["background_pdf"], common_mass, background_yield)
-        total_counts = signal_counts + background_counts
-        import_map[category] = make_weighted_bin_center_dataset(f"expected_{category}", common_mass, total_counts)
-        category_payload[category] = {
-            "signal_counts": signal_counts.tolist(),
-            "background_counts": background_counts.tolist(),
-            "total_counts": total_counts.tolist(),
-        }
-
-    combined_data = ROOT.RooDataSet(
-        "combData",
-        "combData",
-        ROOT.RooArgSet(common_mass, channel),
-        Index=channel,
-        Import=import_map,
+    combined_data, category_hists, category_payload = build_exact_asimov_dataset(
+        category_context=category_context,
+        final_models=final_models,
+        common_mass=common_mass,
+        channel=channel,
+        dataset_name="combData",
     )
     return combined_data, "asimov_expected", {
         "status": "ok",
         "dataset_type": "asimov_expected",
         "generation_hypothesis": "signal_plus_background",
         "mu_gen": 1.0,
-        "construction_mode": "weighted_bin_center_dataset",
+        "construction_mode": "exact_binned_asimov_histogram",
+        "nll_construction": "summed_per_category_binned_nll_with_bin_integrals",
         "blinding_policy_applied": True,
         "categories": category_payload,
-    }
+    }, category_hists
 
 
 def run_fit(processed_samples: list[dict], registry: list[dict], summary: dict, outputs: Path) -> dict:
@@ -532,7 +673,8 @@ def run_fit(processed_samples: list[dict], registry: list[dict], summary: dict, 
     channel = ROOT.RooCategory("channel", "channel")
     for category in category_context:
         channel.defineType(category)
-    shared_mu = ROOT.RooRealVar("mu", "mu", 1.0, -5.0, 10.0)
+    mu_lower = -5.0 if cfg["blinding"]["fit_uses_observed_data"] else 0.0
+    shared_mu = ROOT.RooRealVar("mu", "mu", 1.0, mu_lower, 10.0)
     simultaneous = ROOT.RooSimultaneous("simPdf", "simPdf", channel)
     final_models: dict[str, Any] = {}
     for category, ctx in category_context.items():
@@ -547,14 +689,29 @@ def run_fit(processed_samples: list[dict], registry: list[dict], summary: dict, 
         )
         final_models[category] = model_ctx
         simultaneous.addPdf(model_ctx["model"], category)
-    combined_data, measurement_dataset_type, measurement_dataset_artifact = _measurement_dataset(
+    combined_data, measurement_dataset_type, measurement_dataset_artifact, measurement_category_data = _measurement_dataset(
         category_context=category_context,
         final_models=final_models,
         common_mass=common_mass,
         channel=channel,
         use_observed_data=bool(cfg["blinding"]["fit_uses_observed_data"]),
     )
-    fit_result = fit_pdf(simultaneous, combined_data, fit_range="full", extended=True)
+    if measurement_dataset_type == "observed":
+        exact_fit_details = fit_unbinned_category_nll_sum(
+            final_models=final_models,
+            category_datasets=measurement_category_data or {},
+            shared_mu=shared_mu,
+            mu_value=None,
+        )
+    else:
+        exact_fit_details = fit_exact_binned_category_nll_sum(
+            final_models=final_models,
+            category_datahists=measurement_category_data or {},
+            shared_mu=shared_mu,
+            mu_value=None,
+        )
+    fit_result = exact_fit_details["result"]
+    min_nll = float(exact_fit_details["nll_value"])
 
     workspace_root = fit_dir / "workspace.root"
     workspace = ROOT.RooWorkspace("w")
@@ -575,6 +732,10 @@ def run_fit(processed_samples: list[dict], registry: list[dict], summary: dict, 
         diagnostics.append("RooFit returned non-zero fit_status for the combined measurement fit.")
     if fit_result.covQual() < 2:
         diagnostics.append("Combined measurement fit covariance quality is below the acceptable threshold of 2.")
+    if exact_fit_details["minimize_status"] != 0:
+        diagnostics.append("Minuit2 migrad returned a non-zero status for the combined measurement fit.")
+    if exact_fit_details["hesse_status"] != 0:
+        diagnostics.append("Minuit2 hesse returned a non-zero status for the combined measurement fit.")
     capped_background_categories = sorted(
         category
         for category, choice in background_choice_artifact["categories"].items()
@@ -599,9 +760,10 @@ def run_fit(processed_samples: list[dict], registry: list[dict], summary: dict, 
         "backend": "pyroot_roofit",
         "dataset_type": measurement_dataset_type,
         "observed_data_used_in_fit": measurement_dataset_type == "observed",
+        "fit_method": exact_fit_details["fit_method"],
         "mu_hat": float(shared_mu.getVal()),
         "mu_uncertainty": float(shared_mu.getError()),
-        "min_nll": float(fit_result.minNll()),
+        "min_nll": min_nll,
         "fit_status": int(fit_result.status()),
         "cov_qual": int(fit_result.covQual()),
         "categories": sorted(category_context.keys()),
@@ -611,10 +773,18 @@ def run_fit(processed_samples: list[dict], registry: list[dict], summary: dict, 
         "expected_signal_yields": {category: ctx["expected_signal_yield"] for category, ctx in category_context.items()},
         "fitted_category_yields": fitted_category_yields,
         "diagnostics": diagnostics,
+        "minimize_status": exact_fit_details["minimize_status"],
+        "hesse_status": exact_fit_details["hesse_status"],
         "notes": (
-            ["Observed-data measurement fit is enabled because explicit unblinding was requested."]
+            [
+                "Observed-data measurement fit is enabled because explicit unblinding was requested.",
+                "The unblinded observed-data fit uses a summed per-category unbinned NLL minimized with Minuit2 rather than RooSimultaneous.fitTo().",
+            ]
             if measurement_dataset_type == "observed"
-            else ["Blinded run: central fit performed on signal-plus-background Asimov pseudo-data instead of observed signal-region data."]
+            else [
+                "Blinded run: central fit performed on signal-plus-background Asimov pseudo-data instead of observed signal-region data.",
+                "The blinded expected-only fit uses an exact per-bin Asimov histogram and a summed per-category binned NLL with bin-integrated PDFs.",
+            ]
         ),
     }
     workspace_json = {
@@ -625,6 +795,7 @@ def run_fit(processed_samples: list[dict], registry: list[dict], summary: dict, 
         "categories": sorted(category_context.keys()),
         "backend": "pyroot_roofit",
         "dataset_type": measurement_dataset_type,
+        "fit_method": fit_summary["fit_method"],
     }
     backend_artifact = {
         "status": "ok",
@@ -636,6 +807,7 @@ def run_fit(processed_samples: list[dict], registry: list[dict], summary: dict, 
                 category: background_choice_artifact["categories"][category]["selected_model"]
                 for category in background_choice_artifact["categories"]
             },
+            "measurement_fit_method": fit_summary["fit_method"],
         },
     }
     provenance = {
@@ -682,6 +854,7 @@ def run_fit(processed_samples: list[dict], registry: list[dict], summary: dict, 
         "shared_mu": shared_mu,
         "measurement_dataset_type": measurement_dataset_type,
         "measurement_dataset_artifact": measurement_dataset_artifact,
+        "measurement_category_data": measurement_category_data,
         "prompt_diphoton_effective_lumi_fb": prompt_effective_lumi,
         "smoothing_applied": smoothing_applied,
         "aggregated": aggregated,

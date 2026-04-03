@@ -109,6 +109,72 @@ def test_final_review_blocks_warning_fit_and_missing_inline_images(tmp_path: Pat
     assert review["handoff_ready"] is False
 
 
+def test_final_review_blocks_partial_statistics_runs(tmp_path: Path):
+    outputs = tmp_path / "outputs_case"
+    reports = tmp_path / "reports"
+
+    write_text(
+        "\n".join(
+            [
+                "# Report",
+                "## Introduction",
+                "![plot](plot.png)",
+                "",
+                "*Caption:* demo",
+                "## Dataset Description",
+                "## Object Definitions And Event Selection",
+                "## Signal, Control, And Blinding Regions",
+                "## Distribution Plots",
+                "## Statistical Interpretation",
+                "## Summary",
+            ]
+        ),
+        outputs / "report" / "report.md",
+    )
+    write_text("same", reports / "final_analysis_report.md")
+    write_json({"plot_groups": {}}, outputs / "report" / "plots" / "manifest.json")
+    write_json({"status": "ok"}, outputs / "report" / "artifact_link_inventory.json")
+    write_json({"status": "ok", "failed_checks": []}, outputs / "report" / "enforcement_handoff_gate.json")
+    write_json({"status": "none_found"}, outputs / "report" / "skill_extraction_summary.json")
+    write_json({"status": "no_substantial_discrepancy"}, outputs / "report" / "data_mc_discrepancy_audit.json")
+    write_json({"status": "pass"}, outputs / "report" / "skill_checkpoint_status.json")
+    write_json({"status": "ok"}, outputs / "report" / "smoke_test_execution.json")
+    write_json({"status": "ok"}, outputs / "report" / "verification_status.json")
+    write_json(
+        {
+            "status": "ok",
+            "fit_status": 0,
+            "cov_qual": 3,
+            "backend": "pyroot_roofit",
+            "mu_hat": 1.0,
+            "mu_uncertainty": 0.2,
+        },
+        outputs / "fit" / "FIT1" / "results.json",
+    )
+    write_json(
+        {
+            "status": "ok",
+            "backend": "pyroot_roofit",
+            "q0": 9.0,
+            "z_discovery": 3.0,
+            "fit_status_free": 0,
+            "fit_status_mu0": 0,
+            "cov_qual_free": 3,
+            "cov_qual_mu0": 3,
+        },
+        outputs / "fit" / "FIT1" / "significance_asimov.json",
+    )
+    write_json({"status": "blocked"}, outputs / "fit" / "FIT1" / "significance.json")
+    write_json({"categories": {}}, outputs / "fit" / "FIT1" / "background_pdf_choice.json")
+    write_json({"observed_significance_allowed": False}, outputs / "report" / "blinding_summary.json")
+
+    review = write_final_review(outputs, reports, max_events=20000)
+
+    assert review["status"] == "blocked"
+    assert "partial_statistics_run_presented_as_final" in review["anomalies"]
+    assert review["handoff_ready"] is False
+
+
 def test_verification_status_accepts_asimov_fit_plots(tmp_path: Path):
     plot_manifest = {
         "plot_groups": {

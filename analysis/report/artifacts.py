@@ -415,6 +415,9 @@ def write_execution_contract(summary: dict[str, Any], inputs: Path, outputs: Pat
         "blinding": cfg["blinding"],
         "requested_mode": requested_mode,
         "max_events": max_events,
+        "statistics_scope": "full" if max_events is None else "partial_smoke",
+        "central_claim_eligible": max_events is None,
+        "central_luminosity_fb": cfg["central_mc_lumi_fb"],
         "runtime": runtime_context(),
         "notes": (
             [
@@ -454,6 +457,13 @@ def _reviewer_status(outputs: Path, artifact_relpath: str, passing: set[str]) ->
     return ("pass" if status in passing else "attention"), status
 
 
+def _reviewer_verdict(outputs: Path, reviewer_slug: str) -> str:
+    payload = _load_optional_json(outputs / "report" / "reviewers" / f"{reviewer_slug}.json")
+    if payload is None:
+        return "missing"
+    return str(payload.get("verdict", "missing"))
+
+
 def write_contract_log_bundle(summary: dict[str, Any], inputs: Path, outputs: Path, max_events: int | None) -> dict[str, Any]:
     report_dir = outputs / "report"
     fit_dir = outputs / "fit" / FIT_ID
@@ -490,92 +500,194 @@ def write_contract_log_bundle(summary: dict[str, Any], inputs: Path, outputs: Pa
         for finding in (discrepancy or {}).get("findings", [])
     ]
     smoke_outputs = (smoke or {}).get("smoke_run_outputs")
+    timestamp = utcnow_iso()
+    review_bundle = _load_optional_json(report_dir / "reviewer_outcomes.json")
+    preflight_review = _reviewer_verdict(outputs, "preflight_fact_check_reviewer")
+    summary_review = _reviewer_verdict(outputs, "analysis_summary_reviewer")
+    nominal_review = _reviewer_verdict(outputs, "nominal_sample_and_normalization_reviewer")
+    likelihood_review = _reviewer_verdict(outputs, "likelihood_sample_role_reviewer")
+    stat_review = _reviewer_verdict(outputs, "statistical_readiness_reviewer")
+    blinding_review = _reviewer_verdict(outputs, "blinding_and_visualization_reviewer")
+    discrepancy_review = _reviewer_verdict(outputs, "data_mc_discrepancy_reviewer")
+    repro_review = _reviewer_verdict(outputs, "reproducibility_and_handoff_reviewer")
+
+    def stage_complete(*verdicts: str) -> bool:
+        return all(verdict in {"pass", "conditional_pass"} for verdict in verdicts)
 
     stage_logs = {
         "status": "ok",
-        "generated_at_utc": utcnow_iso(),
+        "generated_at_utc": timestamp,
         "stages": [
             {
+                "stage_id": "stage_1_runtime_and_environment_setup",
                 "stage_number": 1,
                 "stage_name": "Runtime and environment setup",
-                "status": _artifact_status(preflight, {"pass"}),
-                "assumptions": list((preflight or {}).get("assumptions", [])),
-                "deviations": [],
-                "unresolved_issues": list((preflight or {}).get("missing_or_ambiguous", [])),
-                "produced_artifacts": [
+                "started_at_utc": timestamp,
+                "ended_at_utc": timestamp,
+                "status": "completed" if stage_complete(preflight_review, summary_review) else "blocked",
+                "inputs_used": [
+                    str(Path(summary["source_summary"])),
+                    str(inputs),
+                ],
+                "outputs_written": [
                     str(report_dir / "preflight_fact_check.json"),
                     str(report_dir / "runtime_recovery.json"),
                     str(report_dir / "execution_contract.json"),
+                    str(report_dir / "execution_deviations.json"),
+                    str(outputs / "summary.normalized.json"),
+                    str(outputs / "partition" / "partition_spec.json"),
                 ],
-                "next_handoff_target": "Stage 2",
+                "assumptions": list((preflight or {}).get("assumptions", [])),
+                "deviations": list((_load_optional_json(report_dir / "execution_deviations.json") or {}).get("overrides", [])),
+                "unresolved_issues": list((preflight or {}).get("missing_or_ambiguous", [])),
+                "reviewers_run": [
+                    "preflight_fact_check_reviewer",
+                    "analysis_summary_reviewer",
+                ],
+                "review_outcomes": {
+                    "preflight_fact_check_reviewer": preflight_review,
+                    "analysis_summary_reviewer": summary_review,
+                },
+                "blocking_reasons": [] if stage_complete(preflight_review, summary_review) else ["Preflight or analysis-summary reviewer did not pass."],
+                "next_skill": "sample_and_template_semantics_pipeline.md",
             },
             {
+                "stage_id": "stage_2_sample_identification_and_preparation",
                 "stage_number": 2,
                 "stage_name": "Sample identification and preparation",
-                "status": _artifact_status(sample_selection, {"resolved"}),
-                "assumptions": list((sample_selection or {}).get("notes", [])),
-                "deviations": [],
-                "unresolved_issues": [] if (sample_selection or {}).get("status") == "resolved" else ["Nominal-sample selection did not resolve cleanly."],
-                "produced_artifacts": [
+                "started_at_utc": timestamp,
+                "ended_at_utc": timestamp,
+                "status": "completed" if stage_complete(nominal_review, likelihood_review) else "blocked",
+                "inputs_used": [
+                    str(outputs / "samples.registry.json"),
+                    str(report_dir / "likelihood_intake_decision.json"),
+                    str(report_dir / "sample_strategy_decision.json"),
+                ],
+                "outputs_written": [
                     str(outputs / "samples.registry.json"),
                     str(report_dir / "mc_sample_selection.json"),
                     str(outputs / "normalization" / "norm_table.json"),
                     str(outputs / "normalization" / "metadata_resolution.json"),
+                    str(outputs / "samples" / "sample_contracts.json"),
+                    str(outputs / "templates" / "data_driven_template_contracts.json"),
                 ],
-                "next_handoff_target": "Stage 3",
+                "assumptions": list((sample_selection or {}).get("notes", [])),
+                "deviations": [],
+                "unresolved_issues": [] if (sample_selection or {}).get("status") == "resolved" else ["Nominal-sample selection did not resolve cleanly."],
+                "reviewers_run": [
+                    "nominal_sample_and_normalization_reviewer",
+                    "likelihood_sample_role_reviewer",
+                ],
+                "review_outcomes": {
+                    "nominal_sample_and_normalization_reviewer": nominal_review,
+                    "likelihood_sample_role_reviewer": likelihood_review,
+                },
+                "blocking_reasons": [] if stage_complete(nominal_review, likelihood_review) else ["Sample semantics reviewers did not pass."],
+                "next_skill": "event_model_and_partition_generator.md",
             },
             {
+                "stage_id": "stage_3_feature_and_variable_preparation",
                 "stage_number": 3,
                 "stage_name": "Feature and variable preparation",
-                "status": _artifact_status(partition, {"ok"}),
+                "started_at_utc": timestamp,
+                "ended_at_utc": timestamp,
+                "status": "completed" if stage_complete(summary_review) else "blocked",
+                "inputs_used": [
+                    str(outputs / "summary.normalized.json"),
+                ],
+                "outputs_written": [
+                    str(outputs / "summary.normalized.json"),
+                    str(outputs / "partition" / "partition_spec.json"),
+                    str(Path("analysis/regions.yaml")),
+                ],
                 "assumptions": [
                     "Executable category and region definitions are written from the normalized summary.",
                 ],
                 "deviations": [],
                 "unresolved_issues": [],
-                "produced_artifacts": [
-                    str(outputs / "summary.normalized.json"),
-                    str(outputs / "partition" / "partition_spec.json"),
-                    str(Path("analysis/regions.yaml")),
-                ],
-                "next_handoff_target": "Stage 4",
+                "reviewers_run": ["analysis_summary_reviewer"],
+                "review_outcomes": {
+                    "analysis_summary_reviewer": summary_review,
+                },
+                "blocking_reasons": [] if stage_complete(summary_review) else ["Analysis-summary reviewer did not pass."],
+                "next_skill": "selection_and_yield_generator.md",
             },
             {
+                "stage_id": "stage_4_event_selection_and_cut_flow",
                 "stage_number": 4,
                 "stage_name": "Event selection and cut flow",
-                "status": _artifact_status(cutflow, {"ok"}),
+                "started_at_utc": timestamp,
+                "ended_at_utc": timestamp,
+                "status": "completed" if stage_complete(nominal_review) and cutflow is not None else "blocked",
+                "inputs_used": [
+                    str(outputs / "samples.registry.json"),
+                    str(outputs / "partition" / "partition_spec.json"),
+                ],
+                "outputs_written": [
+                    str(report_dir / "cutflow_table.json"),
+                    str(report_dir / "yields_by_category.json"),
+                    str(outputs / "hists" / "processed_samples.json"),
+                ],
                 "assumptions": [
                     "Weighted and unweighted cut-flow interpretations are both preserved.",
                 ],
                 "deviations": [],
                 "unresolved_issues": [] if yields is not None else ["Yield summary missing."],
-                "produced_artifacts": [
-                    str(report_dir / "cutflow_table.json"),
-                    str(report_dir / "yields_by_category.json"),
-                    str(outputs / "hists" / "processed_samples.json"),
-                ],
-                "next_handoff_target": "Stage 5",
+                "reviewers_run": ["nominal_sample_and_normalization_reviewer"],
+                "review_outcomes": {
+                    "nominal_sample_and_normalization_reviewer": nominal_review,
+                },
+                "blocking_reasons": [] if stage_complete(nominal_review) and cutflow is not None else ["Cut-flow stage missing evidence or reviewer approval."],
+                "next_skill": "event_model_and_partition_generator.md",
             },
             {
+                "stage_id": "stage_5_categorization",
                 "stage_number": 5,
                 "stage_name": "Categorization",
-                "status": "completed" if fit_result is not None else "blocked",
+                "started_at_utc": timestamp,
+                "ended_at_utc": timestamp,
+                "status": "completed" if stage_complete(summary_review) and fit_result is not None else "blocked",
+                "inputs_used": [
+                    str(outputs / "partition" / "partition_spec.json"),
+                    str(report_dir / "yields_by_category.json"),
+                ],
+                "outputs_written": [
+                    str(outputs / "partition" / "partition_spec.json"),
+                    str(report_dir / "yields_by_category.json"),
+                    str(fit_dir / "results.json"),
+                ],
                 "assumptions": [
                     "Categories are aligned with the five configured signal regions from the summary.",
                 ],
                 "deviations": [],
                 "unresolved_issues": [f"Inactive configured regions: {', '.join(inactive_regions)}"] if inactive_regions else [],
-                "produced_artifacts": [
-                    str(outputs / "partition" / "partition_spec.json"),
-                    str(report_dir / "yields_by_category.json"),
-                    str(fit_dir / "results.json"),
-                ],
-                "next_handoff_target": "Stage 6",
+                "reviewers_run": ["analysis_summary_reviewer"],
+                "review_outcomes": {
+                    "analysis_summary_reviewer": summary_review,
+                },
+                "blocking_reasons": [] if stage_complete(summary_review) and fit_result is not None else ["Categorization artifacts missing or reviewer blocked."],
+                "next_skill": "background_and_signal_model_generator.md",
             },
             {
+                "stage_id": "stage_6_background_modeling_or_estimation",
                 "stage_number": 6,
                 "stage_name": "Background modeling or estimation",
-                "status": "completed" if background_choice is not None and blinding is not None else "blocked",
+                "started_at_utc": timestamp,
+                "ended_at_utc": timestamp,
+                "status": "completed" if stage_complete(likelihood_review, stat_review) and background_choice is not None and blinding is not None else "blocked",
+                "inputs_used": [
+                    str(outputs / "templates" / "data_driven_template_contracts.json"),
+                    str(outputs / "samples" / "sample_contracts.json"),
+                    str(outputs / "hists" / "templates.json"),
+                ],
+                "outputs_written": [
+                    str(fit_dir / "background_pdf_choice.json"),
+                    str(fit_dir / "background_pdf_scan.json"),
+                    str(fit_dir / "spurious_signal.json"),
+                    str(fit_dir / "background_template_display.json"),
+                    str(report_dir / "blinding_summary.json"),
+                    str(report_dir / "background_template_smoothing_check.json"),
+                ],
                 "assumptions": [
                     "Nominal background template choice is explicit and auditable per category.",
                     "Blinding state is persisted alongside the modeling artifacts.",
@@ -584,20 +696,35 @@ def write_contract_log_bundle(summary: dict[str, Any], inputs: Path, outputs: Pa
                     "Prompt-diphoton template smoothing is applied when effective MC luminosity falls below the required threshold."
                 ] if (smoothing or {}).get("required") else [],
                 "unresolved_issues": [f"Spurious-signal cap reached in: {', '.join(capped_categories)}"] if capped_categories else [],
-                "produced_artifacts": [
-                    str(fit_dir / "background_pdf_choice.json"),
-                    str(fit_dir / "background_pdf_scan.json"),
-                    str(fit_dir / "spurious_signal.json"),
-                    str(fit_dir / "background_template_display.json"),
-                    str(report_dir / "blinding_summary.json"),
-                    str(report_dir / "background_template_smoothing_check.json"),
+                "reviewers_run": [
+                    "likelihood_sample_role_reviewer",
+                    "statistical_readiness_reviewer",
                 ],
-                "next_handoff_target": "Stage 7",
+                "review_outcomes": {
+                    "likelihood_sample_role_reviewer": likelihood_review,
+                    "statistical_readiness_reviewer": stat_review,
+                },
+                "blocking_reasons": [] if stage_complete(likelihood_review, stat_review) and background_choice is not None and blinding is not None else ["Modeling reviewers did not pass or artifacts are missing."],
+                "next_skill": "systematics_and_workspace_generator.md",
             },
             {
+                "stage_id": "stage_7_signal_and_background_fitting_or_statistical_setup",
                 "stage_number": 7,
                 "stage_name": "Signal and background fitting or statistical setup",
-                "status": "completed" if fit_result is not None and asimov is not None and workspace is not None else "blocked",
+                "started_at_utc": timestamp,
+                "ended_at_utc": timestamp,
+                "status": "completed" if stage_complete(stat_review) and fit_result is not None and asimov is not None and workspace is not None else "blocked",
+                "inputs_used": [
+                    str(fit_dir / "background_pdf_choice.json"),
+                    str(outputs / "systematics.json"),
+                ],
+                "outputs_written": [
+                    str(fit_dir / "results.json"),
+                    str(fit_dir / "significance.json"),
+                    str(fit_dir / "significance_asimov.json"),
+                    str(outputs / "fit" / "workspace.json"),
+                    str(outputs / "fit" / "workspace.root"),
+                ],
                 "assumptions": [
                     "RooFit is the primary fit backend for the central H->gammagamma model.",
                     (
@@ -608,164 +735,116 @@ def write_contract_log_bundle(summary: dict[str, Any], inputs: Path, outputs: Pa
                 ],
                 "deviations": [],
                 "unresolved_issues": fit_diagnostics + observed_diagnostics + asimov_diagnostics,
-                "produced_artifacts": [
-                    str(fit_dir / "results.json"),
-                    str(fit_dir / "significance.json"),
-                    str(fit_dir / "significance_asimov.json"),
-                    str(outputs / "fit" / "workspace.json"),
-                    str(outputs / "fit" / "workspace.root"),
-                ],
-                "next_handoff_target": "Stage 8",
+                "reviewers_run": ["statistical_readiness_reviewer"],
+                "review_outcomes": {
+                    "statistical_readiness_reviewer": stat_review,
+                },
+                "blocking_reasons": [] if stage_complete(stat_review) and fit_result is not None and asimov is not None and workspace is not None else ["Statistical reviewer blocked or fit artifacts are missing."],
+                "next_skill": "report_package_generator.md",
             },
             {
+                "stage_id": "stage_8_validation_and_cross_checks",
                 "stage_number": 8,
                 "stage_name": "Validation and cross-checks",
-                "status": "completed" if verification is not None and discrepancy is not None else "blocked",
+                "started_at_utc": timestamp,
+                "ended_at_utc": timestamp,
+                "status": "completed" if stage_complete(blinding_review, discrepancy_review) and verification is not None and discrepancy is not None else "blocked",
+                "inputs_used": [
+                    str(fit_dir / "results.json"),
+                    str(outputs / "report" / "plots" / "manifest.json"),
+                ],
+                "outputs_written": [
+                    str(report_dir / "verification_status.json"),
+                    str(report_dir / "data_mc_discrepancy_audit.json"),
+                    str(report_dir / "smoke_test_execution.json"),
+                ],
                 "assumptions": [
                     "Validation outputs remain explicitly labeled and auditable.",
                 ],
                 "deviations": [],
                 "unresolved_issues": [f"Data/MC discrepancy findings in: {', '.join(discrepancy_findings)}"] if discrepancy_findings else [],
-                "produced_artifacts": [
-                    str(report_dir / "verification_status.json"),
-                    str(report_dir / "data_mc_discrepancy_audit.json"),
-                    str(report_dir / "smoke_test_execution.json"),
+                "reviewers_run": [
+                    "blinding_and_visualization_reviewer",
+                    "data_mc_discrepancy_reviewer",
                 ],
-                "next_handoff_target": "Stage 9",
+                "review_outcomes": {
+                    "blinding_and_visualization_reviewer": blinding_review,
+                    "data_mc_discrepancy_reviewer": discrepancy_review,
+                },
+                "blocking_reasons": [] if stage_complete(blinding_review, discrepancy_review) and verification is not None and discrepancy is not None else ["Validation reviewers did not pass or artifacts are missing."],
+                "next_skill": "report_package_generator.md",
             },
             {
+                "stage_id": "stage_9_result_packaging",
                 "stage_number": 9,
                 "stage_name": "Result packaging",
-                "status": "completed" if (report_dir / "report.md").exists() and (report_dir / "plots" / "manifest.json").exists() else "blocked",
+                "started_at_utc": timestamp,
+                "ended_at_utc": timestamp,
+                "status": "completed" if stage_complete(blinding_review) and (report_dir / "report.md").exists() and (report_dir / "plots" / "manifest.json").exists() else "blocked",
+                "inputs_used": [
+                    str(outputs / "fit" / FIT_ID / "fit_plot_payload.json"),
+                    str(report_dir / "verification_status.json"),
+                ],
+                "outputs_written": [
+                    str(report_dir / "report.md"),
+                    str(report_dir / "artifact_link_inventory.json"),
+                    str(report_dir / "plots" / "manifest.json"),
+                ],
                 "assumptions": [
                     "Plots are embedded inline with captions in the generated markdown report.",
                 ],
                 "deviations": [],
                 "unresolved_issues": [],
-                "produced_artifacts": [
-                    str(report_dir / "report.md"),
-                    str(report_dir / "artifact_link_inventory.json"),
-                    str(report_dir / "plots" / "manifest.json"),
-                ],
-                "next_handoff_target": "Stage 10",
+                "reviewers_run": ["blinding_and_visualization_reviewer"],
+                "review_outcomes": {
+                    "blinding_and_visualization_reviewer": blinding_review,
+                },
+                "blocking_reasons": [] if stage_complete(blinding_review) and (report_dir / "report.md").exists() and (report_dir / "plots" / "manifest.json").exists() else ["Report packaging artifacts missing or blinding reviewer blocked."],
+                "next_skill": "reproducibility_and_handoff_reviewer.md",
             },
             {
+                "stage_id": "stage_10_report_and_log_generation",
                 "stage_number": 10,
                 "stage_name": "Report and log generation",
-                "status": "completed" if (enforcement or {}).get("status") == "ok" and (final_review or {}).get("handoff_ready") else "blocked",
-                "assumptions": [
-                    "Final handoff is valid only if the enforcement gate and reviewer verdict both allow it.",
+                "started_at_utc": timestamp,
+                "ended_at_utc": timestamp,
+                "status": "completed" if stage_complete(repro_review) and (enforcement or {}).get("status") == "ok" and (final_review or {}).get("handoff_ready") else "blocked",
+                "inputs_used": [
+                    str(report_dir / "report.md"),
+                    str(report_dir / "enforcement_handoff_gate.json"),
                 ],
-                "deviations": [],
-                "unresolved_issues": list((final_review or {}).get("handoff_gaps", [])),
-                "produced_artifacts": [
+                "outputs_written": [
                     str(report_dir / "run_manifest.json"),
                     str(report_dir / "reviewer_outcomes.json"),
                     str(report_dir / "final_handoff_state.json"),
                     str(report_dir / "final_report_review.json"),
                 ],
-                "next_handoff_target": "handoff_complete" if (final_review or {}).get("handoff_ready") else "blocked_pending_review",
+                "assumptions": [
+                    "Final handoff is valid only if the enforcement gate and reviewer verdict both allow it.",
+                ],
+                "deviations": [],
+                "unresolved_issues": list((final_review or {}).get("handoff_gaps", [])),
+                "reviewers_run": ["reproducibility_and_handoff_reviewer"],
+                "review_outcomes": {
+                    "reproducibility_and_handoff_reviewer": repro_review,
+                },
+                "blocking_reasons": [] if stage_complete(repro_review) and (enforcement or {}).get("status") == "ok" and (final_review or {}).get("handoff_ready") else list((final_review or {}).get("handoff_gaps", [])),
+                "next_skill": "handoff_complete" if (final_review or {}).get("handoff_ready") else "reproducibility_and_handoff_reviewer.md",
             },
         ],
     }
     write_json(stage_logs, report_dir / "stage_execution_log.json")
 
-    reviewer_outcomes = {
+    reviewer_outcomes = review_bundle or {
         "status": "ok",
-        "generated_at_utc": utcnow_iso(),
-        "reviewers": [
-            {
-                "stage_number": 1,
-                "reviewer": "preflight_fact_check_reviewer",
-                "artifact": str(report_dir / "preflight_fact_check.json"),
-                "verdict": _reviewer_status(outputs, "report/preflight_fact_check.json", {"pass"})[0],
-                "artifact_status": _reviewer_status(outputs, "report/preflight_fact_check.json", {"pass"})[1],
-            },
-            {
-                "stage_number": 2,
-                "reviewer": "nominal_sample_and_normalization_reviewer",
-                "artifact": str(report_dir / "mc_sample_selection.json"),
-                "verdict": _reviewer_status(outputs, "report/mc_sample_selection.json", {"resolved"})[0],
-                "artifact_status": _reviewer_status(outputs, "report/mc_sample_selection.json", {"resolved"})[1],
-            },
-            {
-                "stage_number": 3,
-                "reviewer": "analysis_summary_reviewer",
-                "artifact": str(outputs / "partition" / "partition_spec.json"),
-                "verdict": _reviewer_status(outputs, "partition/partition_spec.json", {"ok"})[0],
-                "artifact_status": _reviewer_status(outputs, "partition/partition_spec.json", {"ok"})[1],
-            },
-            {
-                "stage_number": 4,
-                "reviewer": "nominal_sample_and_normalization_reviewer",
-                "artifact": str(report_dir / "cutflow_table.json"),
-                "verdict": _reviewer_status(outputs, "report/cutflow_table.json", {"ok"})[0],
-                "artifact_status": _reviewer_status(outputs, "report/cutflow_table.json", {"ok"})[1],
-            },
-            {
-                "stage_number": 5,
-                "reviewer": "analysis_summary_reviewer",
-                "artifact": str(fit_dir / "results.json"),
-                "verdict": _reviewer_status(outputs, f"fit/{FIT_ID}/results.json", {"ok", "warning"})[0],
-                "artifact_status": _reviewer_status(outputs, f"fit/{FIT_ID}/results.json", {"ok", "warning"})[1],
-            },
-            {
-                "stage_number": 6,
-                "reviewer": "statistical_readiness_reviewer",
-                "artifact": str(fit_dir / "background_pdf_choice.json"),
-                "verdict": _reviewer_status(outputs, f"fit/{FIT_ID}/background_pdf_choice.json", {"ok"})[0],
-                "artifact_status": _reviewer_status(outputs, f"fit/{FIT_ID}/background_pdf_choice.json", {"ok"})[1],
-            },
-            {
-                "stage_number": 7,
-                "reviewer": "statistical_readiness_reviewer",
-                "artifact": str(fit_dir / "significance.json"),
-                "verdict": _reviewer_status(
-                    outputs,
-                    f"fit/{FIT_ID}/significance.json",
-                    {"ok", "warning"} if requested_mode == "unblinded" else {"blocked"},
-                )[0],
-                "artifact_status": _reviewer_status(
-                    outputs,
-                    f"fit/{FIT_ID}/significance.json",
-                    {"ok", "warning"} if requested_mode == "unblinded" else {"blocked"},
-                )[1],
-            },
-            {
-                "stage_number": 7,
-                "reviewer": "statistical_readiness_reviewer",
-                "artifact": str(fit_dir / "significance_asimov.json"),
-                "verdict": _reviewer_status(outputs, f"fit/{FIT_ID}/significance_asimov.json", {"ok", "warning"})[0],
-                "artifact_status": _reviewer_status(outputs, f"fit/{FIT_ID}/significance_asimov.json", {"ok", "warning"})[1],
-            },
-            {
-                "stage_number": 8,
-                "reviewer": "blinding_and_visualization_reviewer",
-                "artifact": str(report_dir / "verification_status.json"),
-                "verdict": _reviewer_status(outputs, "report/verification_status.json", {"ok"})[0],
-                "artifact_status": _reviewer_status(outputs, "report/verification_status.json", {"ok"})[1],
-            },
-            {
-                "stage_number": 8,
-                "reviewer": "data_mc_discrepancy_reviewer",
-                "artifact": str(report_dir / "data_mc_discrepancy_audit.json"),
-                "verdict": _reviewer_status(outputs, "report/data_mc_discrepancy_audit.json", {"no_substantial_discrepancy", "discrepancy_investigated_no_bug_found"})[0],
-                "artifact_status": _reviewer_status(outputs, "report/data_mc_discrepancy_audit.json", {"no_substantial_discrepancy", "discrepancy_investigated_no_bug_found"})[1],
-            },
-            {
-                "stage_number": 10,
-                "reviewer": "reproducibility_and_handoff_reviewer",
-                "artifact": str(report_dir / "final_report_review.json"),
-                "verdict": _reviewer_status(outputs, "report/final_report_review.json", {"ok"})[0],
-                "artifact_status": _reviewer_status(outputs, "report/final_report_review.json", {"ok"})[1],
-            },
-        ],
+        "generated_at_utc": timestamp,
+        "reviewers": [],
     }
     write_json(reviewer_outcomes, report_dir / "reviewer_outcomes.json")
 
     run_manifest = {
         "status": "ok",
-        "generated_at_utc": utcnow_iso(),
+        "generated_at_utc": timestamp,
         "analysis_name": summary["analysis_metadata"]["analysis_name"],
         "source_summary": summary["source_summary"],
         "config_hash": summary["config_hash"],
@@ -773,6 +852,8 @@ def write_contract_log_bundle(summary: dict[str, Any], inputs: Path, outputs: Pa
         "outputs_root": str(outputs),
         "requested_mode": requested_mode,
         "max_events": max_events,
+        "statistics_scope": "full" if max_events is None else "partial_smoke",
+        "central_claim_eligible": max_events is None,
         "fit_categories": list((fit_result or {}).get("categories", [])),
         "fit_backend": (fit_result or {}).get("backend"),
         "smoke_reference_outputs": smoke_outputs,
@@ -781,10 +862,11 @@ def write_contract_log_bundle(summary: dict[str, Any], inputs: Path, outputs: Pa
     write_json(run_manifest, report_dir / "run_manifest.json")
 
     final_handoff_state = {
-        "status": "ok" if (enforcement or {}).get("status") == "ok" and (final_review or {}).get("handoff_ready") else "blocked",
-        "generated_at_utc": utcnow_iso(),
+        "status": "ok" if stage_complete(repro_review) and (enforcement or {}).get("status") == "ok" and (final_review or {}).get("handoff_ready") else "blocked",
+        "generated_at_utc": timestamp,
         "enforcement_gate_status": (enforcement or {}).get("status", "missing"),
         "final_review_status": (final_review or {}).get("status", "missing"),
+        "reproducibility_review_verdict": repro_review,
         "handoff_ready": bool((final_review or {}).get("handoff_ready")),
         "requested_mode": requested_mode,
         "observed_significance_status": (_load_optional_json(fit_dir / "significance.json") or {}).get("status", "missing"),
@@ -890,7 +972,7 @@ def write_enforcement_handoff_gate(outputs: Path) -> dict[str, Any]:
     return payload
 
 
-def write_final_review(outputs: Path, reports_dir: Path) -> dict[str, Any]:
+def write_final_review(outputs: Path, reports_dir: Path, max_events: int | None = None) -> dict[str, Any]:
     checked = [
         outputs / "report" / "report.md",
         reports_dir / "final_analysis_report.md",
@@ -935,6 +1017,8 @@ def write_final_review(outputs: Path, reports_dir: Path) -> dict[str, Any]:
         anomalies.append("smoke_or_repro_gate_failed")
     if skill_checkpoint.get("status") != "pass":
         anomalies.append("skill_checkpoint_not_pass")
+    if max_events is not None:
+        anomalies.append("partial_statistics_run_presented_as_final")
     capped_categories = sorted(
         category
         for category, payload in background_choice.get("categories", {}).items()

@@ -25,6 +25,23 @@ from analysis.report.artifacts import (
     write_skill_extraction_summary,
     write_verification_status,
 )
+from analysis.report.reviews import (
+    write_analysis_summary_review,
+    write_blinding_and_visualization_review,
+    write_data_mc_discrepancy_review,
+    write_execution_deviations,
+    write_hep_analysis_meta_pipeline_gate,
+    write_likelihood_sample_role_review,
+    write_nominal_sample_and_normalization_review,
+    write_preflight_fact_check_review,
+    write_reproducibility_and_handoff_review,
+    write_reviewer_outcomes_index,
+    write_sample_and_template_semantics_pipeline_gate,
+    write_sample_semantics_artifacts,
+    write_spec_to_runtime_pipeline_gate,
+    write_statistical_readiness_review,
+    write_reporting_and_handoff_pipeline_gate,
+)
 from analysis.report.make_report import build_report
 from analysis.runtime import write_runtime_recovery
 from analysis.samples.metadata import build_metadata_rows, write_metadata_csv, write_metadata_resolution
@@ -133,7 +150,11 @@ def run_all_stages(*, summary, inputs, outputs, max_events, unblind_observed_sig
     policy_defaults = write_enforcement_policy_defaults(normalized, outputs_path)
     write_blinding_summary(normalized, outputs_path)
     write_execution_contract(normalized, inputs_path, outputs_path, max_events)
+    write_execution_deviations(normalized, inputs_path, outputs_path, max_events)
+    _write_partition(normalized, outputs_path)
     run_preflight(summary_path, inputs_path, outputs_path)
+    write_preflight_fact_check_review(outputs_path)
+    write_analysis_summary_review(outputs_path)
 
     metadata_rows = build_metadata_rows(inputs_path)
     write_metadata_csv(metadata_rows, Path("skills/metadata.csv"))
@@ -145,7 +166,9 @@ def run_all_stages(*, summary, inputs, outputs, max_events, unblind_observed_sig
 
     classification, strategy, constraint_map = build_strategy(registry, normalized)
     _write_strategy_products(classification, strategy, constraint_map, outputs_path)
-    _write_partition(normalized, outputs_path)
+    write_sample_semantics_artifacts(normalized, registry, process_roles, classification, strategy, outputs_path)
+    write_nominal_sample_and_normalization_review(outputs_path)
+    write_likelihood_sample_role_review(outputs_path)
 
     processed_samples = []
     cache_dir = outputs_path / "cache"
@@ -162,15 +185,25 @@ def run_all_stages(*, summary, inputs, outputs, max_events, unblind_observed_sig
     write_background_template_smoothing_artifacts(fit_context, outputs_path)
     write_mc_effective_lumi_check(registry, fit_context, outputs_path, policy_defaults)
     write_verification_status(plot_manifest, fit_context, outputs_path)
+    write_statistical_readiness_review(outputs_path, max_events=max_events)
     write_skill_extraction_summary(outputs_path)
     _write_placeholder_skill_refresh(outputs_path)
     build_report(normalized, outputs_path, reports_dir)
+    write_blinding_and_visualization_review(outputs_path)
+    write_data_mc_discrepancy_review(outputs_path)
+    write_reviewer_outcomes_index(outputs_path)
     smoke_outputs = _discover_smoke_outputs(outputs_path)
     if smoke_outputs is not None:
         write_smoke_and_repro_artifacts(normalized, smoke_outputs, outputs_path)
     write_enforcement_handoff_gate(outputs_path)
-    write_final_review(outputs_path, reports_dir)
+    write_final_review(outputs_path, reports_dir, max_events)
+    write_reproducibility_and_handoff_review(outputs_path, max_events=max_events)
+    write_reviewer_outcomes_index(outputs_path)
+    write_spec_to_runtime_pipeline_gate(outputs_path)
+    write_sample_and_template_semantics_pipeline_gate(outputs_path)
+    write_reporting_and_handoff_pipeline_gate(outputs_path)
     write_contract_log_bundle(normalized, inputs_path, outputs_path, max_events)
+    write_hep_analysis_meta_pipeline_gate(outputs_path)
 
     return {
         "summary": normalized,
