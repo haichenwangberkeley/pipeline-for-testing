@@ -1,0 +1,34 @@
+flowchart TD
+    A[Analysis specification<br/>analysis/Higgs-to-diphoton.json] --> B[Summary normalization<br/>analysis/config/load_summary.py]
+    B --> C[Runtime and preflight<br/>analysis/preflight.py]
+    C --> D[Sample registry and semantics<br/>analysis/samples/registry.py]
+    D --> E[Nominal signal choice<br/>generator and decay preference]
+    D --> F[Nominal prompt-diphoton template choice<br/>smallest mass window covering 105-160 GeV]
+    E --> G[Event processing<br/>analysis/hists/histmaker.py]
+    F --> G
+    G --> H[Object selection<br/>photons and jets]
+    H --> I[Exclusive category assignment<br/>analysis/selections/engine.py]
+    I --> J[Event payloads and mass templates]
+    J --> K[Background candidate scan on observed sidebands]
+    J --> L[Prompt-diphoton template scaling and smoothing check]
+    L --> M[Spurious-signal tests]
+    K --> N[Background-PDF choice per category]
+    M --> N
+    J --> O[Signal PDF fit from nominal Higgs MC]
+    N --> P[Combined category likelihood]
+    O --> P
+    P --> Q[Central fit]
+    Q --> R[Blinded path<br/>expected-only measurement dataset]
+    Q --> S[Unblinded path<br/>observed measurement dataset]
+    P --> T[Expected significance<br/>exact S+B Asimov RooDataHist]
+    P --> U[Observed significance<br/>observed per-category datasets]
+    R --> V[Artifacts and plots]
+    S --> V
+    T --> V
+    U --> V
+    V --> W[Reviewers, gates, and final handoff]
+    X[Skill contracts under .codex/skills] --> C
+    X --> D
+    X --> N
+    X --> T
+    X --> W
